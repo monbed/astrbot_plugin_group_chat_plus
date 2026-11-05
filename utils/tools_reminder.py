@@ -276,6 +276,55 @@ class ToolsReminder:
         return "\n".join(formatted_parts)
 
     @staticmethod
+    async def get_selected_persona(
+        context: Context, unified_msg_origin: str, platform_name: str = ""
+    ) -> Optional[Dict]:
+        """
+        获取当前会话生效的人格
+
+        Args:
+            context: Context对象
+            unified_msg_origin: 会话的unified_msg_origin
+            platform_name: 平台名称
+
+        Returns:
+            人格配置，None表示没有生效的人格、解析失败或旧版不支持
+        """
+        try:
+            # 检查是否有persona_manager和conversation_manager（兼容旧版AstrBot）
+            if not hasattr(context, "persona_manager") or not hasattr(
+                context, "conversation_manager"
+            ):
+                if DEBUG_MODE:
+                    logger.info("当前AstrBot版本不支持人格解析")
+                return None
+
+            persona_mgr = context.persona_manager
+            conv_mgr = context.conversation_manager
+
+            if not persona_mgr or not conv_mgr:
+                return None
+
+            # 获取当前会话的人格；尚无对话时按配置的默认人格解析，避免首轮不受人格限制
+            conversation_persona_id = None
+            curr_cid = await conv_mgr.get_curr_conversation_id(unified_msg_origin)
+            if curr_cid:
+                conv = await conv_mgr.get_conversation(unified_msg_origin, curr_cid)
+                conversation_persona_id = getattr(conv, "persona_id", None)
+
+            # 解析当前生效的人格
+            _, persona, _, _ = await persona_mgr.resolve_selected_persona(
+                umo=unified_msg_origin,
+                conversation_persona_id=conversation_persona_id,
+                platform_name=platform_name,
+            )
+            return persona or None
+
+        except Exception as e:
+            logger.warning(f"解析当前会话人格失败,不应用人格限制: {e}")
+            return None
+
+    @staticmethod
     async def get_persona_tool_names(
         context: Context, unified_msg_origin: str, platform_name: str = ""
     ) -> Optional[List[str]]:
@@ -290,59 +339,17 @@ class ToolsReminder:
         Returns:
             工具名称列表，None表示使用所有工具（人格未限制或旧版不支持）
         """
-        try:
-            # 检查是否有persona_manager和conversation_manager（兼容旧版AstrBot）
-            if not hasattr(context, "persona_manager") or not hasattr(
-                context, "conversation_manager"
-            ):
-                if DEBUG_MODE:
-                    logger.info("当前AstrBot版本不支持人格工具过滤,使用全部工具")
-                return None
-
-            persona_mgr = context.persona_manager
-            conv_mgr = context.conversation_manager
-
-            if not persona_mgr or not conv_mgr:
-                return None
-
-            # 获取当前会话的conversation_id
-            curr_cid = await conv_mgr.get_curr_conversation_id(unified_msg_origin)
-            if not curr_cid:
-                return None
-
-            # 获取当前会话对象，提取persona_id
-            conv = await conv_mgr.get_conversation(unified_msg_origin, curr_cid)
-            if not conv:
-                return None
-
-            conversation_persona_id = getattr(conv, "persona_id", None)
-
-            # 解析当前生效的人格
-            persona_id, persona, _, _ = await persona_mgr.resolve_selected_persona(
-                umo=unified_msg_origin,
-                conversation_persona_id=conversation_persona_id,
-                platform_name=platform_name,
-            )
-
-            if not persona:
-                return None
-
-            # 获取人格的tools字段
-            persona_tools = persona.get("tools", None)
-
-            if persona_tools is None:
-                # None表示使用所有工具
-                if DEBUG_MODE:
-                    logger.info(f"人格 {persona_id} 未限制工具,使用全部工具")
-                return None
-
-            if DEBUG_MODE:
-                logger.info(f"人格 {persona_id} 限制工具列表: {persona_tools}")
-            return persona_tools
-
-        except Exception as e:
-            logger.warning(f"获取人格工具列表失败,回退到全部工具: {e}")
+        persona = await ToolsReminder.get_selected_persona(
+            context, unified_msg_origin, platform_name
+        )
+        if not persona:
             return None
+
+        # 获取人格的tools字段，None表示使用所有工具
+        persona_tools = persona.get("tools", None)
+        if DEBUG_MODE:
+            logger.info(f"人格工具配置: {persona_tools}")
+        return persona_tools
 
     @staticmethod
     def inject_tools_to_message(

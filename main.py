@@ -10985,21 +10985,92 @@ class ChatPlus(Star):
                     f"  ✅ 已追加插件静态指令到 system_prompt，长度: {len(plugin_static_instructions)} 字符"
                 )
 
+        # 🔧 修复：恢复主人格的工具选择，否则人格中取消勾选的插件/MCP 工具仍会发给 AI
+        # 原因同下方子代理编排：请求没有 conversation 时框架跳过人格工具过滤，
+        # 而 plugin_tool_set 又包含全部已启用工具。框架内置工具由全局配置决定，不受影响。
+        if plugin_tool_set is not None:
+            try:
+                from .utils.subagent_bridge import remove_tools_outside_persona
+
+                persona_allowed_tool_names = reminder_allowed_tool_names
+                if persona_allowed_tool_names is None:
+                    persona_allowed_tool_names = (
+                        await ToolsReminder.get_persona_tool_names(
+                            self.context,
+                            event.unified_msg_origin,
+                            event.get_platform_name(),
+                        )
+                    )
+                removed_tool_names = remove_tools_outside_persona(
+                    req.func_tool,
+                    self.context.get_llm_tool_manager().func_list,
+                    persona_allowed_tool_names,
+                )
+                if removed_tool_names:
+                    logger.info(
+                        f"[人格工具过滤] 已移除主人格未勾选的工具 {len(removed_tool_names)} 个"
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ 应用主人格工具过滤时出错（不影响主流程）: {e}")
+
+        # 🔧 修复：恢复 AstrBot 子代理编排（transfer_to_* 工具、主 LLM 工具去重、路由提示词）
+        # 原因：本插件的请求没有 conversation 对象，框架的 _ensure_persona_and_skills()
+        # 会提前返回并跳过这些步骤。主动对话不传工具集（明确禁用工具调用），因此不在此恢复。
+        subagent_handoff_names: list[str] = []
+        if plugin_tool_set is not None:
+            try:
+                from .utils.subagent_bridge import apply_subagent_orchestration
+
+                subagent_result = apply_subagent_orchestration(req, self.context)
+                subagent_handoff_names = subagent_result.handoff_names
+                if subagent_handoff_names:
+                    logger.info(
+                        "[子代理编排] 已注入子代理工具: "
+                        f"{subagent_handoff_names}，"
+                        f"移除主 LLM 重复工具 {len(subagent_result.removed_tool_names)} 个"
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ 恢复子代理编排时出错（不影响主流程）: {e}")
+
         # 🔧 修复：注入 Skills 提示词，避免插件接管 LLM 请求后丢失技能识别
         # 原因：插件通过 event.request_llm() 创建的 ProviderRequest 没有 conversation 对象，
         # 导致框架的 _ensure_persona_and_skills() 跳过执行，Skills 提示词不会被注入。
-        # 这里手动加载活跃的 Skills 并追加到 system_prompt 中。
+        # 这里按框架的规则加载 Skills（运行环境、当前配置、工作区、主人格勾选）并追加到 system_prompt。
         try:
+            from astrbot.core.astr_main_agent import (
+                _filter_skills_for_current_config,
+                _get_workspace_path_for_umo,
+            )
             from astrbot.core.skills.skill_manager import (
                 SkillManager,
                 build_skills_prompt,
             )
+            from .utils.subagent_bridge import collect_request_skills
 
-            skill_manager = SkillManager()
-            skills = skill_manager.list_skills(active_only=True)
+            current_conf = self.context.get_config(umo=event.unified_msg_origin) or {}
+            skill_provider_settings = current_conf.get("provider_settings", {})
+            skills = await collect_request_skills(
+                SkillManager(),
+                skill_provider_settings,
+                await ToolsReminder.get_selected_persona(
+                    self.context,
+                    event.unified_msg_origin,
+                    event.get_platform_name(),
+                ),
+                _filter_skills_for_current_config,
+                lambda: _get_workspace_path_for_umo(
+                    event.unified_msg_origin, self.context
+                ),
+            )
             if skills:
                 skills_prompt = build_skills_prompt(skills)
                 req.system_prompt += f"\n{skills_prompt}\n"
+                if skill_provider_settings.get("computer_use_runtime", "none") == "none":
+                    req.system_prompt += (
+                        "User has not enabled the Computer Use feature. "
+                        "You cannot use shell or Python to perform skills. "
+                        "If you need to use these capabilities, ask the user to enable Computer Use in the AstrBot WebUI -> Config."
+                    )
                 if self.debug_mode:
                     logger.info(f"  ✅ 已注入 Skills 提示词，技能数量: {len(skills)}")
         except Exception as e:
@@ -11040,6 +11111,13 @@ class ChatPlus(Star):
                             event.get_platform_name(),
                         )
                     )
+
+                # 子代理工具不属于主人格的工具白名单，但主 LLM 可以调用，需要出现在提醒中
+                if effective_allowed_tool_names is not None:
+                    effective_allowed_tool_names = [
+                        *effective_allowed_tool_names,
+                        *subagent_handoff_names,
+                    ]
 
                 current_conf = (
                     self.context.get_config(umo=event.unified_msg_origin) or {}
