@@ -275,6 +275,7 @@ from .utils.image_description_cache import (
 )  # 🆕 v1.2.0: 图片描述缓存
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
+from .utils import self_learning_bridge  # 自学习插件好感度联动
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 
 
@@ -2666,6 +2667,10 @@ class ChatPlus(Star):
         # key: chat_id, value: {"unified_msg_origin": str, "platform_name": str, "is_private": bool, "chat_id": str, "self_id": str, "platform_id": str}
         self._idle_flush_meta = {}
 
+        # 自学习插件好感度联动：已补交、尚未完成的后台任务（terminate 时取消）
+        self._self_learning_affection_tasks = set()
+        self._self_learning_bridge_warned = False
+
         # 🆕 主动对话正在处理的会话标记（用于普通对话和主动对话之间的并发保护）
         # 格式: {chat_id: timestamp}，记录主动对话开始处理的时间
         # 普通对话在清空缓存前会检查此标记，避免与主动对话冲突
@@ -3529,6 +3534,10 @@ class ChatPlus(Star):
             await self._cancel_idle_flush_task(chat_id)
         self._idle_flush_meta.clear()
 
+        for affection_task in list(self._self_learning_affection_tasks):
+            affection_task.cancel()
+        self._self_learning_affection_tasks.clear()
+
         if self.proactive_enabled:
             try:
                 await ProactiveChatManager.stop_background_task()
@@ -4093,6 +4102,10 @@ class ChatPlus(Star):
                 )
                 event.call_llm = True
                 return
+
+            # 保存用户发送的原文：后面的入群/转发解析会改写 event.message_str，
+            # 而补交给自学习插件好感度系统的必须是它自己监听时看到的那份文本
+            event.set_extra("_gcp_raw_message_str", _raw_msg_str)
 
             self._check_compliance_status()
 
@@ -5420,6 +5433,59 @@ class ChatPlus(Star):
                 )
 
         return is_at_message, has_trigger_keyword, matched_trigger_keyword
+
+    def _plan_self_learning_affection(
+        self,
+        event: AstrMessageEvent,
+        is_at_message: bool,
+        has_trigger_keyword: bool,
+    ) -> str:
+        """判断当前消息是否、以及何时补交给自学习插件的好感度系统。
+
+        自学习插件只在 event.is_at_or_wake_command 为真时更新好感度。关键词触发、
+        文本形式的@ 不会让框架置位该标记，需要由本插件补交。
+
+        Returns:
+            self_learning_bridge 中的 SUBMIT_NOW / SUBMIT_AFTER_DECISION / SKIP
+        """
+        return self_learning_bridge.plan_affection_submission(
+            is_at_message=is_at_message,
+            has_trigger_keyword=has_trigger_keyword,
+            framework_woken=bool(getattr(event, "is_at_or_wake_command", False)),
+            keyword_smart_mode=self.keyword_smart_mode,
+        )
+
+    def _submit_affection_to_self_learning(self, event: AstrMessageEvent) -> None:
+        """把当前消息补交给自学习插件的好感度系统。
+
+        自学习插件未安装、未启用好感度，或内部结构与预期不符时直接跳过，
+        任何异常都不影响本插件的回复流程。
+        """
+        try:
+            plugin = self_learning_bridge.find_self_learning_plugin(self.context)
+            if plugin is None:
+                return
+
+            raw_text = event.get_extra("_gcp_raw_message_str", None)
+            if raw_text is None:
+                raw_text = event.get_message_str()
+            outcome = self_learning_bridge.submit_affection_interaction(
+                plugin,
+                event,
+                raw_text,
+                self._self_learning_affection_tasks,
+            )
+            if outcome == self_learning_bridge.INCOMPATIBLE:
+                if not self._self_learning_bridge_warned:
+                    self._self_learning_bridge_warned = True
+                    logger.warning(
+                        "[自学习联动] 当前自学习插件未提供预期的好感度处理入口，"
+                        "关键词触发的消息无法计入好感度（可能是其版本结构已变化）"
+                    )
+            elif self.debug_mode:
+                logger.info(f"[自学习联动] 好感度补交结果: {outcome}")
+        except Exception as e:
+            logger.warning(f"[自学习联动] 补交好感度时出错（不影响回复）: {e}")
 
     async def _check_probability_before_processing(
         self,
@@ -9473,6 +9539,15 @@ class ChatPlus(Star):
             matched_trigger_keyword,
         ) = await self._check_message_triggers(event)
 
+        # 自学习插件好感度联动：框架未把这条消息标为唤醒消息（关键词触发、文本@）时，
+        # 自学习插件不会为它计好感度，这里补交。必须在等待窗口之前读取唤醒标记，
+        # 因为窗口合并会把 event.is_at_or_wake_command 改为 False。
+        affection_plan = self._plan_self_learning_affection(
+            event, is_at_message, has_trigger_keyword
+        )
+        if affection_plan == self_learning_bridge.SUBMIT_NOW:
+            self._submit_affection_to_self_learning(event)
+
         # 步骤2.5: 检测戳一戳信息（v1.0.9新增，在概率判断前提取）
         is_at_all_message = False
         try:
@@ -10261,6 +10336,10 @@ class ChatPlus(Star):
             if self.debug_mode:
                 logger.info("=" * 60)
             return
+
+        # 关键词智能模式：读空气AI确认回复后，才把这条消息计入自学习插件的好感度
+        if affection_plan == self_learning_bridge.SUBMIT_AFTER_DECISION:
+            self._submit_affection_to_self_learning(event)
 
         # 🔧 processing_id 作为插件内部处理实例ID，与平台重复推送去重ID解耦
         message_id = processing_id
