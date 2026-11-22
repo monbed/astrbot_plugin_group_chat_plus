@@ -36,6 +36,7 @@ from astrbot.core.provider.entities import ProviderRequest
 from astrbot.api.all import AstrBotMessage, MessageType, MessageMember
 
 from ...utils.ai_error_formatter import format_ai_error
+from ...utils.tool_history import fold_tool_messages
 
 # 🆕 v1.2.0: 导入钩子调用相关模块
 from astrbot.core.star.star_handler import EventType
@@ -3645,6 +3646,9 @@ class ProactiveChatManager:
                             # 解析官方对话系统的历史记录
                             try:
                                 official_history = json.loads(conversation.history)
+                                # 官方管道的工具调用折叠成 AI 回复里的文本记录，
+                                # 避免 tool 消息被当成用户发言
+                                official_history = fold_tool_messages(official_history)
                                 if debug_mode:
                                     logger.info(
                                         f"[主动对话] 从官方对话系统获取到 {len(official_history)} 条历史记录"

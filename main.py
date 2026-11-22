@@ -276,6 +276,16 @@ from .utils.image_description_cache import (
 from .utils._session_guard import emit_plugin_metadata as _emit_fingerprint
 from .utils.content_filter import ContentFilterManager  # 🆕 v1.2.0: AI回复内容过滤器
 from .utils import self_learning_bridge  # 自学习插件好感度联动
+from .utils.tool_history import (  # 工具调用记录的文本化（写入与读取共用）
+    fold_tool_messages,
+    format_tool_record,
+    request_with_tool_calls,
+)
+
+# 保存 agent 实际使用的 ProviderRequest 的 event extra 键。
+# AstrBot 的 collect_initial_request 会对 extra 中的 provider_request 做 copy.copy，
+# 工具循环只把 tool_calls_result 追加到这份拷贝上，原对象上始终是 None。
+_GCP_RUNNER_REQUEST_EXTRA = "_gcp_runner_request"
 from .private_chat import PrivateChatMain  # 🆕 私信功能主处理模块
 
 
@@ -7237,6 +7247,10 @@ class ChatPlus(Star):
                                         official_history = json.loads(conv.content)
                                     except Exception:
                                         official_history = None
+                        # 官方管道把工具调用存成 assistant.tool_calls + tool 消息。
+                        # 先折叠成 AI 回复里的文本记录再截取：否则 tool 消息会被当成
+                        # 群友发言、调用的工具名和参数丢失，截取还可能把一次调用切成两半
+                        official_history = fold_tool_messages(official_history)
                         if (
                             isinstance(official_history, list)
                             and len(official_history) > 0
@@ -7587,6 +7601,9 @@ class ChatPlus(Star):
 
             if not isinstance(official_history, list) or len(official_history) == 0:
                 return None
+
+            # 与主流程一致：先把官方管道的工具调用折叠成文本记录，再按条数截取
+            official_history = fold_tool_messages(official_history)
 
             self_id = event.get_self_id()
             platform_name = event.get_platform_name()
@@ -10786,6 +10803,9 @@ class ChatPlus(Star):
             # 不是本插件的请求，不做任何处理
             return
 
+        # 钩子收到的 req 才是 agent 持有的那一份，留下引用供保存回复时读取工具调用结果
+        event.set_extra(_GCP_RUNNER_REQUEST_EXTRA, req)
+
         self._check_compliance_status()
 
         # 获取插件存储的自定义数据
@@ -12684,8 +12704,13 @@ class ChatPlus(Star):
             交错排列的完整消息文本，无工具调用时返回空字符串
         """
         try:
-            req = event.get_extra("provider_request")
-            if not req or not getattr(req, "tool_calls_result", None):
+            # 优先用 on_llm_request 留下的 agent 请求；extra 里的 provider_request
+            # 是框架拷贝前的原对象，只在未拷贝的旧版 AstrBot 上带有工具调用结果
+            req = request_with_tool_calls(
+                event.get_extra(_GCP_RUNNER_REQUEST_EXTRA),
+                event.get_extra("provider_request"),
+            )
+            if not req:
                 return ""
 
             tool_calls_list = req.tool_calls_result
@@ -12734,11 +12759,7 @@ class ChatPlus(Star):
                         else:
                             continue
 
-                        # 截断过长参数
-                        if len(func_args) > 200:
-                            func_args = func_args[:200] + "..."
-
-                        # 获取对应工具结果
+                        # 获取对应工具结果（过长的参数和结果由 format_tool_record 截断）
                         result_preview = ""
                         if i < len(tool_results):
                             result_content = getattr(tool_results[i], "content", None)
@@ -12760,19 +12781,9 @@ class ChatPlus(Star):
                             elif result_content is not None:
                                 result_preview = str(result_content)
 
-                            # 截断过长结果
-                            if len(result_preview) > 500:
-                                result_preview = result_preview[:500] + "..."
-
-                        result_preview = result_preview.strip()
-                        if result_preview:
-                            tool_line = f"- {func_name}({func_args}) → {result_preview}"
-                        else:
-                            tool_line = f"- {func_name}({func_args}) → (无返回)"
-
                         # 每个工具独立一个块，不再合并
                         interleaved_parts.append(
-                            "[工具调用记录开始]\n" + tool_line + "\n[工具调用记录结束]"
+                            format_tool_record(func_name, func_args, result_preview)
                         )
 
             # 剩余的 pending_texts 是最后一轮工具调用之后 AI 的最终回复
