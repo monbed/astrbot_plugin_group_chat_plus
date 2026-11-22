@@ -12759,7 +12759,7 @@ class ChatPlus(Star):
                         else:
                             continue
 
-                        # 获取对应工具结果（过长的参数和结果由 format_tool_record 截断）
+                        # 获取对应工具结果（完整保留；过长的参数由 format_tool_record 截断）
                         result_preview = ""
                         if i < len(tool_results):
                             result_content = getattr(tool_results[i], "content", None)

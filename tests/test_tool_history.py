@@ -178,10 +178,24 @@ def test_history_without_tool_calls_is_passed_through():
     assert tool_history.fold_tool_messages(None) is None
 
 
-def test_long_arguments_and_results_are_truncated():
-    text = tool_history.format_tool_record("search", "a" * 300, "b" * 600 + "  ")
+def test_long_arguments_are_truncated_and_results_are_kept_in_full():
+    long_result = "b" * 30000
 
-    assert text == record("search", "a" * 200 + "...", "b" * 500 + "...")
+    text = tool_history.format_tool_record("search", "a" * 300, long_result + "  ")
+
+    assert text == record("search", "a" * 200 + "...", long_result)
     assert tool_history.format_tool_record("t", {"k": "值"}, "") == record(
         "t", '{"k": "值"}', tool_history.NO_RESULT_TEXT
     )
+
+
+def test_official_tool_results_are_kept_in_full_too():
+    long_result = "r" * 30000
+    history = [
+        {"role": "assistant", "content": None, "tool_calls": [call("c1", "search")]},
+        {"role": "tool", "tool_call_id": "c1", "content": long_result},
+    ]
+
+    folded = tool_history.fold_tool_messages(history)
+
+    assert folded[0]["content"] == record("search", "{}", long_result)

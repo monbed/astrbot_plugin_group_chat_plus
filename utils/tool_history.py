@@ -24,7 +24,6 @@ TOOL_RECORD_END = "[工具调用记录结束]"
 UNKNOWN_TOOL_NAME = "未知工具"
 NO_RESULT_TEXT = "(无返回)"
 MAX_ARGUMENTS_LENGTH = 200
-MAX_RESULT_LENGTH = 500
 
 _TOOL_ONLY_KEYS = ("tool_calls", "tool_call_id")
 
@@ -79,7 +78,9 @@ def format_tool_record(name: Any, arguments: Any, result: Any) -> str:
         result: Text the tool returned.
 
     Returns:
-        A block delimited by the record markers, with long values truncated.
+        A block delimited by the record markers. Arguments are cut at
+        ``MAX_ARGUMENTS_LENGTH``; the result is kept in full, because a search
+        result cut short is of little use to later replies.
     """
     if isinstance(arguments, str):
         arguments_text = arguments
@@ -94,8 +95,6 @@ def format_tool_record(name: Any, arguments: Any, result: Any) -> str:
         arguments_text = arguments_text[:MAX_ARGUMENTS_LENGTH] + "..."
 
     result_text = result if isinstance(result, str) else ""
-    if len(result_text) > MAX_RESULT_LENGTH:
-        result_text = result_text[:MAX_RESULT_LENGTH] + "..."
     result_text = result_text.strip() or NO_RESULT_TEXT
 
     tool_name = name if isinstance(name, str) and name else UNKNOWN_TOOL_NAME
