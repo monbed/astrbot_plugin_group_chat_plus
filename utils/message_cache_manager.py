@@ -17,6 +17,7 @@ from .message_processor import MessageProcessor
 from .message_cleaner import MessageCleaner
 from .proactive_chat_manager import ProactiveChatManager
 from .context_manager import ContextManager
+from .core_compat import order_history_messages
 
 
 def _append_persistent_poke_event_text(base_text: str, event_text: str) -> str:
@@ -465,11 +466,10 @@ class MessageCacheManager:
 
         # 合并并排序
         if cached_astrbot_messages:
-            all_messages = history_messages + cached_astrbot_messages
-            all_messages.sort(
-                key=lambda msg: (
-                    msg.timestamp if hasattr(msg, "timestamp") and msg.timestamp else 0
-                )
+            # 官方历史在前（保持入库顺序），缓存等其余消息按时间戳在后；
+            # 没有官方记录时等同于纯按时间戳排序
+            all_messages = order_history_messages(
+                history_messages + cached_astrbot_messages
             )
 
             if self.debug_mode:

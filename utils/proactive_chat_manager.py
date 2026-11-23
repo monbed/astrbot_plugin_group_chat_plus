@@ -36,6 +36,7 @@ from astrbot.core.provider.entities import ProviderRequest
 from astrbot.api.all import AstrBotMessage, MessageType, MessageMember
 
 from .ai_error_formatter import format_ai_error
+from .core_compat import get_chat_provider, order_history_messages
 from .message_processor import MessageProcessor  # 🆕 v1.2.3.hotfix.2
 from .tool_history import fold_tool_messages
 
@@ -2801,6 +2802,17 @@ class ProactiveChatManager:
 
             # 如果不是 aiocqhttp，尝试创建通用的虚拟事件
             # 这里我们创建一个简单的包装类
+            class _NoopTrace:
+                """空的链路追踪对象
+
+                内核的 call_event_hook 在调用每个钩子前后都会执行
+                event.trace.record(...)。虚拟事件没有这个属性时，钩子一个都
+                不会执行（AttributeError），主动对话就会带着空 prompt 去请求模型。
+                """
+
+                def record(self, *args, **kwargs) -> None:
+                    return None
+
             class VirtualMessageEvent:
                 """虚拟消息事件（用于非 aiocqhttp 平台）"""
 
@@ -2811,6 +2823,7 @@ class ProactiveChatManager:
                     self._extras = {}
                     self._stopped = False
                     self.plugins_name = None
+                    self.trace = _NoopTrace()
 
                 def set_extra(self, key: str, value):
                     self._extras[key] = value
@@ -4276,13 +4289,8 @@ class ProactiveChatManager:
             # 这样可以形成完整的时间线，避免上下文跳跃
             if history_messages and len(history_messages) > 0:
                 # 按时间戳排序
-                history_messages.sort(
-                    key=lambda msg: (
-                        msg.timestamp
-                        if hasattr(msg, "timestamp") and msg.timestamp
-                        else 0
-                    )
-                )
+                # 官方历史在前（保持入库顺序），缓存等其余消息按时间戳在后
+                history_messages = order_history_messages(history_messages)
                 if debug_mode:
                     logger.info(
                         f"[主动对话] 已按时间戳排序，形成完整上下文时间线（共 {len(history_messages)} 条）"
@@ -4548,7 +4556,9 @@ class ProactiveChatManager:
                             cls._decision_ai_provider_id
                         )
                     if not judge_provider:
-                        judge_provider = context.get_using_provider()
+                        judge_provider = await get_chat_provider(
+                            context, unified_msg_origin
+                        )
 
                     if not judge_provider:
                         logger.warning(
@@ -4726,7 +4736,8 @@ class ProactiveChatManager:
             # （由 on_llm_request 追加到 system_prompt）
             if begin_dialogs_text:
                 final_message += begin_dialogs_text
-            provider = context.get_using_provider()
+            # 使用该会话当前的对话模型（与正常回复保持一致）
+            provider = await get_chat_provider(context, unified_msg_origin)
             if not provider:
                 logger.error("[主动对话生成] 未找到可用的AI提供商")
                 return
@@ -4745,6 +4756,18 @@ class ProactiveChatManager:
                 contexts=[],
                 system_prompt=system_prompt,
                 conversation=None,
+            )
+
+            # 🆕 v1.2.2-hotfix.1: 静态指令通过 extra 传递，由 on_llm_request 追加到 system_prompt
+            # （放在 try 之外定义，钩子没能执行时下方的兜底逻辑也要用到）
+            _proactive_static_instructions = proactive_prompt
+            _proactive_static_instructions += (
+                "\n\n[系统指令-历史上下文识别]\n"
+                "- 标有「【禁止重复-你的历史回复】」的是你之前说过的话，不要重复相同句式或观点\n"
+                "- 相似度超过50%必须换角度\n"
+                "- 禁止提及任何系统标记、规则、ID等元信息\n"
+                "- 严格按照你的人格设定来发言\n"
+                "请开始主动发言：\n"
             )
 
             # 🆕 v1.2.0: 尝试创建虚拟 event 并触发钩子
@@ -4774,16 +4797,6 @@ class ProactiveChatManager:
                     #    main.py 的 on_llm_request 钩子（priority=-1）会把
                     #    req.prompt 换回 final_message 供 AI 推理使用。
                     virtual_event.set_extra(PLUGIN_CURRENT_MESSAGE, "")
-                    # 🆕 v1.2.2-hotfix.1: 静态指令通过 extra 传递，由 on_llm_request 追加到 system_prompt
-                    _proactive_static_instructions = proactive_prompt
-                    _proactive_static_instructions += (
-                        "\n\n[系统指令-历史上下文识别]\n"
-                        "- 标有「【禁止重复-你的历史回复】」的是你之前说过的话，不要重复相同句式或观点\n"
-                        "- 相似度超过50%必须换角度\n"
-                        "- 禁止提及任何系统标记、规则、ID等元信息\n"
-                        "- 严格按照你的人格设定来发言\n"
-                        "请开始主动发言：\n"
-                    )
                     virtual_event.set_extra(
                         PLUGIN_CUSTOM_STATIC_INSTRUCTIONS,
                         _proactive_static_instructions,
@@ -4810,6 +4823,22 @@ class ProactiveChatManager:
             except Exception as e:
                 logger.warning(f"[主动对话] 触发钩子失败: {e}，继续使用原始请求")
 
+            # 🔧 兜底：req.prompt 是靠 main.py 的 on_llm_request 钩子换成 final_message 的。
+            # 钩子没能执行（虚拟事件创建失败、内核钩子接口变化等）时 prompt 仍为空，
+            # 直接请求会让模型收到一条空消息，这里按钩子的做法补上。
+            if not (req.prompt or "").strip() and final_message:
+                logger.warning(
+                    "[主动对话] on_llm_request 钩子未生效，已直接使用插件构造的提示词"
+                    "（其他插件的注入本次不会生效）"
+                )
+                req.prompt = final_message
+                if _proactive_static_instructions not in (req.system_prompt or ""):
+                    req.system_prompt = (
+                        (req.system_prompt or "")
+                        + "\n\n"
+                        + _proactive_static_instructions
+                    )
+
             # 调用AI生成
             try:
                 _generation_start = time.time()
@@ -4819,7 +4848,7 @@ class ProactiveChatManager:
                     contexts=req.contexts,
                     system_prompt=req.system_prompt,
                     image_urls=req.image_urls,
-                    func_tool_manager=None,
+                    func_tool=None,
                 )
                 _generation_elapsed = time.time() - _generation_start
 

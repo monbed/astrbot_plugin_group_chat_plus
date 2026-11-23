@@ -19,6 +19,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from astrbot.api.all import *
 from .ai_response_filter import AIResponseFilter
 from .ai_error_formatter import format_ai_error
+from .core_compat import get_chat_provider
 from ._session_guard import sample_guard
 
 # 详细日志开关（与 main.py 同款方式：单独用 if 控制）
@@ -557,9 +558,14 @@ class DecisionAI:
                 provider = context.get_provider_by_id(provider_id)
                 if not provider:
                     logger.warning(f"无法找到提供商 {provider_id},使用默认提供商")
-                    provider = context.get_using_provider()
+                    provider = await get_chat_provider(
+                        context, getattr(event, "unified_msg_origin", None)
+                    )
             else:
-                provider = context.get_using_provider()
+                # 未指定提供商：使用当前会话的对话模型（与正常回复保持一致）
+                provider = await get_chat_provider(
+                    context, getattr(event, "unified_msg_origin", None)
+                )
 
             if not provider:
                 logger.error("无法获取AI提供商")
@@ -981,9 +987,14 @@ class DecisionAI:
                 provider = context.get_provider_by_id(provider_id)
                 if not provider:
                     logger.warning(f"无法找到提供商 {provider_id},使用默认提供商")
-                    provider = context.get_using_provider()
+                    provider = await get_chat_provider(
+                        context, getattr(event, "unified_msg_origin", None)
+                    )
             else:
-                provider = context.get_using_provider()
+                # 未指定提供商：使用当前会话的对话模型（与正常回复保持一致）
+                provider = await get_chat_provider(
+                    context, getattr(event, "unified_msg_origin", None)
+                )
 
             if not provider:
                 logger.error("无法获取AI提供商")

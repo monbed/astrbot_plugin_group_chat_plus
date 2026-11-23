@@ -406,7 +406,8 @@ class ChatPlus(Star):
             return True
         # 平台 LTM 注入特征检测：需要同时命中 header 短语 + 条目格式 [name/HH:MM:SS]:
         # 单靠 header 短语可能误匹配第三方插件内容，加上条目格式确保精确识别
-        if "You are now in a chatroom" in text:
+        # 旧版内核 header: "You are now in a chatroom..."；新版: "You are in a group chat..."
+        if "You are now in a chatroom" in text or "You are in a group chat" in text:
             import re
 
             if re.search(r"\[\S+?/\d{2}:\d{2}:\d{2}\]:", text):
@@ -10814,6 +10815,20 @@ class ChatPlus(Star):
         plugin_prompt = event.get_extra(PLUGIN_CUSTOM_PROMPT, "")
         plugin_image_urls = event.get_extra(PLUGIN_IMAGE_URLS, [])
         plugin_short_prompt = event.get_extra(PLUGIN_CURRENT_MESSAGE, "") or ""
+
+        # 🔧 新版内核的平台群聊上下文不再改 system_prompt/contexts，而是往
+        # req.extra_user_content_parts 追加一个 <system_reminder> 历史块。
+        # 本插件用自己的历史构造请求，这里把平台那一份移除，否则 AI 会收到两份历史。
+        # 必须在下面拍快照之前做，保证快照和逐插件追踪数据里都不再带着它。
+        _removed_platform_history = PlatformLTMHelper.strip_platform_group_history(
+            req, event.get_extra("_gcp_per_plugin_injections", None)
+        )
+        if _removed_platform_history and self.debug_mode:
+            logger.info(
+                "  ✅ 已移除平台群聊上下文注入的历史块: "
+                f"{_removed_platform_history} 个（避免与插件自己的历史重复）"
+            )
+
         req_snapshot = self._snapshot_request_before_rewrite(req)
         absorbed_prompt_texts: list[str] = []
         absorbed_contexts: list[dict] = []

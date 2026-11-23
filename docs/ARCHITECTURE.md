@@ -1373,6 +1373,8 @@ AstrBot 平台的 LTM 系统实际上有**两套独立的存储**：
 
 所以实际上发生的事情是：
 
+> **新版 AstrBot 的命名与注入方式有变化**（已对照 v4.29.4 源码）：存储 A 现在是内置插件上的 `group_chat_context.raw_records`（旧版为 `ltm.session_chats`）；注入位置也从 system_prompt 改成了 `req.extra_user_content_parts` 里一个以 `<system_reminder>You are in a group chat.` 开头的文本块。本插件两种都能识别并移除，下文沿用旧名称描述。
+
 1. 平台 LTM 收到消息 → 写入 session_chats（内存）+ platform_message_history（数据库）
 2. 本插件需要回复时 → 从 platform_message_history（数据库）读取历史
 3. 平台 LTM 在 on_llm_request 中注入 session_chats 内容到 system_prompt

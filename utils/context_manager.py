@@ -23,6 +23,7 @@ import re
 import time
 from datetime import datetime
 from ._session_guard import guard_session
+from .core_compat import db_datetime_to_epoch, order_history_messages
 from .message_processor import MessageProcessor
 
 # 导入 MessageCleaner（延迟导入以避免循环依赖）
@@ -909,13 +910,11 @@ class ContextManager:
             msg.platform_name = platform_name
 
             # 处理时间戳
-            if hasattr(history_item, "created_at") and history_item.created_at:
-                if isinstance(history_item.created_at, datetime):
-                    msg.timestamp = int(history_item.created_at.timestamp())
-                else:
-                    msg.timestamp = 0
-            else:
-                msg.timestamp = 0
+            # 官方存储的 created_at 是「不带时区信息的 UTC 时间」，不能直接 .timestamp()
+            # （会被按本机时区解释，UTC+8 下偏早 8 小时），统一走 db_datetime_to_epoch
+            msg.timestamp = db_datetime_to_epoch(
+                getattr(history_item, "created_at", None)
+            )
 
             # 设置消息类型
             msg.type = (
@@ -1162,11 +1161,9 @@ class ContextManager:
 
             # ========== 4. 按时间排序并截断 ==========
             # 按时间戳排序
-            history.sort(
-                key=lambda m: (
-                    m.timestamp if hasattr(m, "timestamp") and m.timestamp else 0
-                )
-            )
+            # 官方历史在前（保持入库顺序），缓存等其余消息按时间戳在后；
+            # 没有官方记录时等同于纯按时间戳排序
+            history = order_history_messages(history)
 
             # 截断到有效限制
             if len(history) > effective_limit:
@@ -1378,11 +1375,9 @@ class ContextManager:
                     )
 
             # ========== 4. 按时间排序并截断 ==========
-            history.sort(
-                key=lambda m: (
-                    m.timestamp if hasattr(m, "timestamp") and m.timestamp else 0
-                )
-            )
+            # 官方历史在前（保持入库顺序），缓存等其余消息按时间戳在后；
+            # 没有官方记录时等同于纯按时间戳排序
+            history = order_history_messages(history)
 
             if len(history) > effective_limit:
                 history = history[-effective_limit:]

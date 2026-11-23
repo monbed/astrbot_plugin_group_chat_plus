@@ -1629,7 +1629,9 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}
             return self.plugin.config.config_path
         # 回退：手动拼接
         try:
-            from astrbot.core.config import get_astrbot_config_path
+            # get_astrbot_config_path 定义在 astrbot_path 模块里；
+            # astrbot.core.config 并不导出它，从那里导入必定失败
+            from astrbot.core.utils.astrbot_path import get_astrbot_config_path
 
             config_dir = get_astrbot_config_path()
             return os.path.join(
